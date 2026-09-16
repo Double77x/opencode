@@ -105,7 +105,7 @@ const make = Effect.gen(function* () {
       global.home,
       ".opencode",
       "bin",
-      process.platform === "win32" ? "opencode2.exe" : "opencode2",
+      process.platform === "win32" ? "opencode.exe" : "opencode",
     )
     if (path.resolve(process.execPath) === path.resolve(binary)) return "curl"
     if (!installedPackage) return
@@ -167,6 +167,11 @@ const make = Effect.gen(function* () {
 
   const latest = () => release().pipe(Effect.map((data) => data.version))
 
+  const temporaryDirectory = (prefix: string) =>
+    Effect.acquireRelease(fs.makeTempDirectory({ directory: global.cache, prefix }), (directory) =>
+      fs.remove(directory, { recursive: true, force: true }).pipe(Effect.ignore),
+    )
+
   const upgrade = Effect.fnUntraced(function* (method: Method, input: string) {
     if (!parseReleaseVersion(input)) return yield* Effect.fail(new Error(`Invalid version: ${input}`))
     const version = input.trim().replace(/^v/, "")
@@ -181,7 +186,10 @@ const make = Effect.gen(function* () {
         "npm",
         "install",
         "--global",
-        ...(installedPackage && packageName !== installedPackage ? ["--force"] : []),
+        ...((OPENCODE_ARTIFACT === "cli" && !installedPackage?.endsWith("/cli-node")) ||
+        (installedPackage && packageName !== installedPackage)
+          ? ["--force"]
+          : []),
         target,
       ],
       pnpm: ["pnpm", "add", "--global", `--allow-build=${packageName}`, target],
@@ -192,12 +200,12 @@ const make = Effect.gen(function* () {
         if (method === "bun") {
           // Bun does not prune old versions from its shared package cache.
           yield* fs.makeDirectory(global.cache, { recursive: true })
-          const cache = yield* fs.makeTempDirectoryScoped({ directory: global.cache, prefix: "update-" })
+          const cache = yield* temporaryDirectory("update-")
           return yield* exec(["bun", "install", "--global", "--trust", "--cache-dir", cache, target], "5 minutes")
         }
         if (method === "curl") {
           yield* fs.makeDirectory(global.cache, { recursive: true })
-          const directory = yield* fs.makeTempDirectoryScoped({ directory: global.cache, prefix: "update-" })
+          const directory = yield* temporaryDirectory("update-")
           const installer = path.join(directory, "install")
           const download = yield* exec(
             ["curl", "-fsSL", "-o", installer, "https://opencode.ai/v2/install"],

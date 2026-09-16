@@ -258,13 +258,13 @@ test("concurrent service processes elect one server", async () => {
     expect((await Bun.file(config).json()).password).toBe(info.password)
     expect(await Bun.file(registration + ".lock").exists()).toBe(false)
     expect(
-      await fetch(new URL("/api/health", info.url), {
+      await fetch(new URL("/api/status", info.url), {
         headers: { authorization: "Basic " + btoa(`opencode:${info.password}`) },
       }).then((response) => response.json()),
     ).toEqual({
-      healthy: true,
       version: info.version,
       pid: info.pid,
+      urls: [info.url],
     })
     const contender = Bun.spawn(command, { env, stderr: "pipe", stdout: "ignore" })
     try {
@@ -339,7 +339,7 @@ test.each([
       const info = await waitForInfo(registration)
       await Promise.all(
         [...new Set([...cors, ...origins, "https://unlisted.example.com"])].map(async (origin) => {
-          const response = await fetch(new URL("/api/health", info.url), {
+          const response = await fetch(new URL("/api/status", info.url), {
             method: "OPTIONS",
             headers: { Origin: origin, "Access-Control-Request-Method": "GET" },
           })
@@ -398,10 +398,7 @@ test("service ensure surfaces managed port conflict in error", async () => {
         file: registration,
         env,
         command: [process.execPath, path.join(import.meta.dir, "../src/index.ts"), "serve", "--service"],
-      }).pipe(
-        Effect.flip,
-        Effect.provide(NodeFileSystem.layer),
-      ),
+      }).pipe(Effect.flip, Effect.provide(NodeFileSystem.layer)),
     )
     expect(error.message).toContain(`Managed service port ${port} on 127.0.0.1 is already in use by another process`)
     expect(error.message).toContain("opencode service set port <port>")
@@ -469,7 +466,7 @@ test("port contender recognizes an incumbent registered during the bind race", a
     fetch() {
       requests.count += 1
       if (requests.count === 2) recognizing.resolve()
-      return Response.json({ healthy: true, version: OPENCODE_VERSION, pid: process.pid }, { status: 503 })
+      return Response.json({ version: OPENCODE_VERSION, pid: process.pid, urls: [] }, { status: 503 })
     },
   })
   const registration = path.join(root, "state", "opencode", "service-local.json")
@@ -604,7 +601,7 @@ async function waitForInfo(file: string, accept: (info: Info) => boolean = () =>
 
 async function waitForFailed(info: Info) {
   for (let attempt = 0; attempt < 400; attempt++) {
-    const status = await fetch(new URL("/api/health", info.url), {
+    const status = await fetch(new URL("/api/status", info.url), {
       headers: { authorization: "Basic " + btoa(`opencode:${info.password}`) },
     })
       .then((response) => response.status)

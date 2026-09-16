@@ -7,6 +7,7 @@ import type { Session } from "@opencode/schema/session"
 import type { SessionInbox } from "@opencode/schema/session-inbox"
 import type { SessionError } from "@opencode/schema/session-error"
 import type { SessionMessage } from "@opencode/schema/session-message"
+import type { TokenUsage } from "@opencode/schema/token-usage"
 import type { JsonSchema, Types } from "effect"
 import type { ModelHooks } from "./registration.js"
 
@@ -18,16 +19,39 @@ export interface SessionPrompt {
   delivery: SessionInbox.Delivery
 }
 
-export interface SessionContext {
+/** Request overrides. Typed keys are generation settings; any other key is a provider option. */
+export type SessionRequestOptions = Types.DeepMutable<GenerationOptionsFields> & Record<string, unknown>
+
+export interface SessionRequest {
   readonly sessionID: Session.ID
-  readonly agent: Agent.ID
   readonly model: Model.Ref
   system: Array<SystemPart>
   messages: Array<Message>
+  options: SessionRequestOptions
+}
+
+export interface SessionContext extends SessionRequest {
+  readonly agent: Agent.ID
   tools: Record<string, { description: string; input: JsonSchema.JsonSchema }>
-  /** Request overrides; unset fields retain route and model defaults. */
-  generation: Types.DeepMutable<GenerationOptionsFields>
-  providerOptions: Record<string, unknown>
+}
+
+export interface SessionCompactionResult {
+  summary: string
+  providerState?: SessionMessage.ProviderState
+  metadata?: Record<string, unknown>
+  tokens?: TokenUsage.Info
+}
+
+export interface SessionCompaction extends SessionContext {
+  /** Set to use this compaction and skip the model request. */
+  result?: SessionCompactionResult
+}
+
+export interface SessionGenerate extends SessionContext {}
+
+export interface SessionTitle extends SessionRequest {
+  /** Set to use this title and skip the model request. */
+  result?: string
 }
 
 /**
@@ -62,6 +86,19 @@ export interface SessionHttpResponse {
   response: Response
 }
 
+/**
+ * Connection a WebSocket-backed request opens or reuses. Runs once per model call before the
+ * Session's socket is selected; changing `url` or `headers` reopens the socket. Experimental.
+ */
+export interface SessionWebSocketHandshake {
+  readonly sessionID: Session.ID
+  readonly agent: Agent.ID
+  readonly model: Model.Ref
+  readonly kind: SessionRequestKind
+  url: string
+  headers: Record<string, string>
+}
+
 export type SessionRetryDecision = { retry: false } | { retry: true; delay: number }
 
 export interface SessionRetry {
@@ -76,9 +113,13 @@ export interface SessionRetry {
 export interface SessionHooks {
   readonly prompt: SessionPrompt
   readonly context: SessionContext
+  readonly compaction: SessionCompaction
+  readonly generate: SessionGenerate
+  readonly title: SessionTitle
   readonly "model.request": SessionModelRequest
   readonly "http.request": SessionHttpRequest
   readonly "http.response": SessionHttpResponse
+  readonly "experimental.ws.handshake": SessionWebSocketHandshake
   readonly retry: SessionRetry
 }
 
@@ -93,7 +134,7 @@ export type SessionDomain = Pick<
   | "command"
   | "synthetic"
   | "interrupt"
-  | "rename"
+  | "update"
   | "move"
   | "wait"
   | "context"

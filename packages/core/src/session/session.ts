@@ -3,6 +3,7 @@ export * as Session from "./session.js"
 import { DateTime, Effect, Fiber, Scope } from "effect"
 import type { Agent } from "@opencode/schema/agent"
 import type { Model } from "@opencode/schema/model"
+import type { Permission } from "@opencode/schema/permission"
 import { Event } from "@opencode/schema/event"
 import { FSUtil } from "@opencode/util/fs-util"
 import { Bus } from "../bus.js"
@@ -71,6 +72,13 @@ export const make = Effect.fn("Session.make")(function* () {
   const rename = Effect.fn("Session.rename")(function* (sessionID: SessionSchema.ID, input: { title: string }) {
     yield* get(sessionID)
     yield* bus.publish(SessionEvent.Renamed, { sessionID, title: input.title })
+  })
+  const setPermissions = Effect.fn("Session.setPermissions")(function* (
+    sessionID: SessionSchema.ID,
+    input: { permissions: Permission.Ruleset },
+  ) {
+    yield* get(sessionID)
+    yield* bus.publish(SessionEvent.Permissions, { sessionID, permissions: input.permissions })
   })
   const switchAgent = Effect.fn("Session.switchAgent")(function* (
     sessionID: SessionSchema.ID,
@@ -164,7 +172,7 @@ export const make = Effect.fn("Session.make")(function* () {
   )
   const shell = Effect.fn("Session.shell")(function* (
     sessionID: SessionSchema.ID,
-    input: { id?: Event.ID; command: string },
+    input: { id?: SessionMessage.ID; command: string },
   ) {
     const session = yield* get(sessionID)
     // The server owns completion recording even if the submitting client disconnects.
@@ -187,7 +195,7 @@ export const make = Effect.fn("Session.make")(function* () {
           sessionID,
           shell: started.info,
         },
-        { id: input.id },
+        { id: input.id ? Event.ID.make(input.id.replace(/^msg_/, "evt_")) : undefined },
       )
       const terminal = yield* started.result
       const preview = yield* started.output
@@ -208,7 +216,7 @@ export const make = Effect.fn("Session.make")(function* () {
   })
   const skill = Effect.fn("Session.skill")(function* (
     sessionID: SessionSchema.ID,
-    input: { id?: SessionMessage.ID; skill: Skill.ID; resume?: boolean },
+    input: { messageID?: SessionMessage.ID; skill: Skill.ID; resume?: boolean },
   ) {
     const session = yield* get(sessionID)
     const skill = yield* SessionSkill.get({ session, skill: input.skill }).pipe(
@@ -222,7 +230,7 @@ export const make = Effect.fn("Session.make")(function* () {
         name: skill.name,
         text: skill.content,
       },
-      { id: input.id ? Event.ID.make(input.id.replace(/^msg_/, "evt_")) : undefined },
+      { id: input.messageID ? Event.ID.make(input.messageID.replace(/^msg_/, "evt_")) : undefined },
     )
     if (input.resume !== false)
       yield* execution
@@ -299,7 +307,7 @@ export const make = Effect.fn("Session.make")(function* () {
       ),
   )
   const interrupt = Effect.fn("Session.interrupt")(
-    (sessionID: SessionSchema.ID, options?: { readonly continue?: boolean }) =>
+    (sessionID: SessionSchema.ID, options?: { readonly resume?: boolean }) =>
       Effect.uninterruptible(execution.interrupt(sessionID, options)),
   )
   const stage = Effect.fn("Session.revert.stage")(function* (
@@ -334,6 +342,7 @@ export const make = Effect.fn("Session.make")(function* () {
     message,
     view,
     rename,
+    setPermissions,
     switchAgent,
     switchModel,
     inbox,
@@ -356,6 +365,7 @@ export const make = Effect.fn("Session.make")(function* () {
     const message = operations.message.bind(undefined, sessionID)
     const view = operations.view.bind(undefined, sessionID)
     const rename = operations.rename.bind(undefined, sessionID)
+    const setPermissions = operations.setPermissions.bind(undefined, sessionID)
     const switchAgent = operations.switchAgent.bind(undefined, sessionID)
     const switchModel = operations.switchModel.bind(undefined, sessionID)
     const inbox = operations.inbox.bind(undefined, sessionID)
@@ -381,6 +391,7 @@ export const make = Effect.fn("Session.make")(function* () {
       message,
       view,
       rename,
+      setPermissions,
       switchAgent,
       switchModel,
       inbox,

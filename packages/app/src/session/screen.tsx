@@ -9,10 +9,13 @@ import {
   createEffect,
   createComputed,
   on,
+  onMount,
 } from "solid-js"
 import { createStore } from "solid-js/store"
+import { makeEventListener } from "@solid-primitives/event-listener"
+import { debounce } from "@solid-primitives/scheduled"
 import { ResizeHandle } from "@opencode/ui/resize-handle"
-import { MessageTimeline, SessionSummaryPanel } from "@/session/timeline/message-timeline"
+import { MessageTimeline } from "@/session/timeline/message-timeline"
 import { useServer } from "@/runtime/server/current"
 import { projectForSession } from "@/shell/layout/helpers"
 import { ComposerDropzone } from "@/composer/dropzone"
@@ -34,10 +37,16 @@ import { SessionIdentityHeader } from "./session-identity-header"
 import { SessionReviewToggle } from "./header/session-header-actions"
 import { createAnimatedPresence } from "@/runtime/animated-presence"
 import { createSessionBrowser } from "./browser/model"
+import { createTimelineCache } from "./timeline/cache"
 
 const SessionMobileFiles = lazy(async () => {
   const { SessionMobileFiles } = await import("./files/session-mobile-files")
   return { default: SessionMobileFiles }
+})
+
+const SessionSummaryPanel = lazy(async () => {
+  const { SessionSummaryPanel } = await import("./summary/panel")
+  return { default: SessionSummaryPanel }
 })
 
 export function SessionScreen(props: { session: SessionModel }) {
@@ -69,11 +78,24 @@ export function SessionScreen(props: { session: SessionModel }) {
     sideTerminalPresent: false,
     mobileTerminalCached: false,
     mobileMoveDismissed: false,
+    summaryResizeTranslate: undefined as string | undefined,
   })
   const [elements, setElements] = createStore<{
+    chat?: HTMLDivElement
     side?: HTMLDivElement
     bottomTerminal?: HTMLDivElement
   }>({})
+  const finishWindowResize = debounce(() => setStore("summaryResizeTranslate", undefined), 150)
+  onMount(() => {
+    makeEventListener(window, "resize", () => {
+      if (store.summaryResizeTranslate === undefined) {
+        const content = elements.chat?.querySelector("[data-timeline-virtual-content]")
+        // Freeze the painted offset, including an in-flight slide, until resizing settles.
+        setStore("summaryResizeTranslate", content ? getComputedStyle(content).translate : "none")
+      }
+      finishWindowResize()
+    })
+  })
   const sideVisible = createMemo(() => isDesktop() && screen.side.layout().visible)
   const sideTerminalVisible = createMemo(() => isDesktop() && screen.terminal.side() && screen.terminal.open())
   const bottomTerminalVisible = createMemo(() => isDesktop() && screen.terminal.open() && screen.terminal.bottom())
@@ -219,6 +241,45 @@ export function SessionScreen(props: { session: SessionModel }) {
     </Show>
   )
 
+  const timelineView = createTimelineCache(
+    session,
+    (source, active) => (
+      <MessageTimeline
+        active={active()}
+        hideHeader={!isDesktop()}
+        session={source}
+        background={composer.requests.background}
+        actions={composer.actions.timeline}
+        scroll={timeline.scroll}
+        onResumeScroll={timeline.actions.resume}
+        setScrollRef={timeline.view.setScrollRef}
+        onScheduleScrollState={timeline.view.scheduleScrollState}
+        onPin={timeline.view.pin}
+        onUnpin={timeline.view.unpin}
+        onUserScroll={timeline.view.markUserScroll}
+        onHistoryScroll={timeline.view.onHistoryScroll}
+        onSelectionInteraction={timeline.view.selectionInteraction}
+        pinned={timeline.view.pinned()}
+        centered={screen.centered()}
+        reserveReviewToggle={!sideVisible()}
+        setContentRef={timeline.view.setContentRef}
+        diffs={review.details.diffs}
+        onReview={review.open}
+        workspaceMoveEligible={composer.workspaceMoveEligible()}
+        onSummaryOpenChange={review.details.setOpen}
+        anchor={timeline.view.anchor}
+        setRevealMessage={timeline.view.setRevealMessage}
+        setScrollToEnd={timeline.view.setScrollToEnd}
+        search={
+          <Show when={active()}>
+            <TimelineSearchBar controller={timelineSearch} />
+          </Show>
+        }
+      />
+    ),
+    () => conversationVisible() && messagesReady(),
+  )
+
   const sessionPanelContent = () => (
     <>
       <ComposerDropzone
@@ -258,36 +319,7 @@ export function SessionScreen(props: { session: SessionModel }) {
             <Show when={isDesktop() && !messagesReady()}>
               <SessionIdentityHeader sessionID={session.identity.params.id ?? ""} session={session.data.info()} />
             </Show>
-            <Show when={messagesReady() ? session.identity.params.id : undefined} keyed>
-              {(_id) => (
-                <MessageTimeline
-                  hideHeader={!isDesktop()}
-                  session={session}
-                  background={composer.requests.background}
-                  actions={composer.actions.timeline}
-                  scroll={timeline.scroll}
-                  onResumeScroll={timeline.actions.resume}
-                  setScrollRef={timeline.view.setScrollRef}
-                  onScheduleScrollState={timeline.view.scheduleScrollState}
-                  onPin={timeline.view.pin}
-                  onUnpin={timeline.view.unpin}
-                  onUserScroll={timeline.view.markUserScroll}
-                  onHistoryScroll={timeline.view.onHistoryScroll}
-                  onSelectionInteraction={timeline.view.selectionInteraction}
-                  pinned={timeline.view.pinned()}
-                  centered={screen.centered()}
-                  setContentRef={timeline.view.setContentRef}
-                  diffs={review.details.diffs}
-                  onReview={review.open}
-                  workspaceMoveEligible={composer.workspaceMoveEligible()}
-                  onSummaryOpenChange={review.details.setOpen}
-                  anchor={timeline.view.anchor}
-                  setRevealMessage={timeline.view.setRevealMessage}
-                  setScrollToEnd={timeline.view.setScrollToEnd}
-                  search={<TimelineSearchBar controller={timelineSearch} />}
-                />
-              )}
-            </Show>
+            <Show when={messagesReady() && session.identity.params.id}>{timelineView()}</Show>
           </Match>
         </Switch>
       </div>
@@ -322,6 +354,9 @@ export function SessionScreen(props: { session: SessionModel }) {
               "transition-none": screen.size.active() || !sidePresence.animate(),
             }}
             data-slot="session-chat-panel"
+            ref={(element) => setElements("chat", element)}
+            data-summary-open={isDesktop() && review.details.open()}
+            data-summary-resizing={store.summaryResizeTranslate !== undefined}
             data-width-animating={store.sideWidthMotion}
             data-scrollbar-hidden={store.timelineScrollbarHidden || store.sideWidthMotion}
             onPointerMove={revealTimelineScrollbar}
@@ -333,6 +368,7 @@ export function SessionScreen(props: { session: SessionModel }) {
             onTransitionCancel={trackSideWidthMotion}
             style={{
               width: screen.panel.width(),
+              "--session-summary-resize-translate": store.summaryResizeTranslate,
             }}
           >
             <Show when={!!session.identity.params.id}>

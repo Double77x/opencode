@@ -20,7 +20,7 @@ import { OpenAIChat } from "@opencode/ai/protocols/openai-chat"
 import { AnthropicMessages, OpenAIResponses } from "@opencode/ai/protocols"
 import { compileRequest } from "@opencode/ai/route/client"
 import { TestLLM } from "@opencode/ai/testing"
-import { Catalog } from "@opencode/core/catalog"
+import type { SessionHooks } from "@opencode/plugin/effect/session"
 import { Database } from "@opencode/core/database/database"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
@@ -55,6 +55,7 @@ import { PluginSupervisor } from "@opencode/core/plugin/supervisor"
 import { Plugin } from "@opencode/core/plugin"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { OptimizePlugin } from "@opencode/core/plugin/optimize"
+import { IdentityPlugin } from "@opencode/core/plugin/identity"
 import { QuestionTool } from "@opencode/core/tool/plugin/question"
 import { Agent } from "@opencode/core/agent"
 import { Config } from "@opencode/core/config"
@@ -62,12 +63,7 @@ import { Document, Info } from "@opencode/schema/config"
 import { ConfigCompaction } from "@opencode/schema/config/compaction"
 import { Tool } from "@opencode/core/tool"
 import type { Info as ToolInfo } from "@opencode/schema/tool"
-import {
-  InstructionStateTable,
-  SessionInboxTable,
-  SessionMessageTable,
-  SessionTable,
-} from "@opencode/core/session/sql"
+import { InstructionStateTable, SessionInboxTable, SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
 import { InstructionEntry } from "@opencode/core/session/instruction-entry"
 import { SessionStore } from "@opencode/core/session/store"
 import { Instructions } from "@opencode/core/instructions/index"
@@ -88,7 +84,7 @@ import { promptLocationNode } from "./fixture/prompt-location"
 import { LocationServiceMap } from "@opencode/core/location-service-map"
 import { Expected } from "./lib/session-message"
 import { permissionLayer } from "./lib/permission"
-import { agentHost, catalogHost, host } from "./plugin/host"
+import { agentHost, modelHost, host, noProviders } from "./plugin/host"
 import { CodeModeInstructions } from "@opencode/core/codemode/instructions"
 
 const emptyCodeMode = `\n\n${CodeModeInstructions.render({ total: 0, shown: 0, namespaces: [] })}`
@@ -119,6 +115,11 @@ const testModel = (id: string, limit: ModelLimit = defaultModelLimit) => {
 }
 const model = testModel("fake-model")
 const defaultSystem = SessionSystemPrompt.make([])
+const identity = (providerID: string, id: string) =>
+  ["# Your Model", `- Name: ${id}`, `- Provider ID: ${providerID}`, `- Model ID: ${id}`].join("\n")
+const fakeIdentity = identity("fake", "fake-model")
+const replacementIdentity = identity("fake", "replacement")
+const gptIdentity = identity("openai", "gpt-5")
 const replacementModel = testModel("replacement")
 const compactModel = testModel("compact", { context: 4_000, output: 50 })
 const fullOutputModel = testModel("full-output", { context: 262_144, output: 262_144 })
@@ -391,19 +392,12 @@ const layer = Layer.unwrap(
         }),
       }),
     ])
-    const promptCatalog = Layer.mock(Catalog.Service, {
-      provider: {
-        get: () => Effect.undefined,
-        all: () => Effect.succeed([]),
-        available: () => Effect.succeed([]),
-      },
-      model: {
-        get: () => Effect.undefined,
-        all: () => Effect.succeed([]),
-        available: () => Effect.succeed([]),
-        default: () => Effect.undefined,
-        small: () => Effect.undefined,
-      },
+    const promptModels = Layer.mock(Model.Service, {
+      get: () => Effect.undefined,
+      all: () => Effect.succeed([]),
+      available: () => Effect.succeed([]),
+      default: () => Effect.undefined,
+      small: () => Effect.undefined,
     })
     const replacements: LayerNode.Replacements = [
       Snapshot.node.replace(Snapshot.noopLayer),
@@ -463,7 +457,7 @@ const layer = Layer.unwrap(
         SessionStore.node,
         SessionInbox.node,
         Agent.node,
-        Catalog.node,
+        Model.node,
         Tool.node,
         PluginHooks.node,
         echoNode,
@@ -484,7 +478,7 @@ const layer = Layer.unwrap(
         ...replacements,
         Bus.node.replace(Bus.configured({ persist: true })),
         LocationServiceMap.node.replace(promptLocationNode),
-        Catalog.node.replace(promptCatalog),
+        Model.node.replace(promptModels),
         SessionExecution.node.replace(execution),
       ],
     )
@@ -517,16 +511,18 @@ const setup = Effect.gen(function* () {
   const bus = yield* Bus.Service
   const sessionInbox = yield* SessionInbox.Service
   const agents = yield* Agent.Service
-  const catalog = yield* Catalog.Service
+  const models = yield* Model.Service
   const hooks = yield* PluginHooks.Service
   const pluginHost = host({
     agent: agentHost(agents),
-    catalog: catalogHost(catalog),
+    model: modelHost(models),
+    provider: noProviders,
     session: { hook: (name, callback) => hooks.register("session", name, callback) },
   })
   yield* Effect.forEach(OptimizePlugin.Plugins, (plugin) => plugin.effect(pluginHost), {
     discard: true,
   })
+  yield* IdentityPlugin.Plugin.effect(pluginHost)
   yield* agents.transform((editor) =>
     editor.update(Agent.ID.make("build"), (agent) => {
       agent.mode = "primary"
@@ -1078,6 +1074,24 @@ describe("SessionRunnerLLM", () => {
     ])
   })
 
+  scenario("executes a tool renamed by a session context hook", function* (s) {
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "context", (event) =>
+      Effect.sync(() => {
+        event.tools.renamed_echo = event.tools.echo!
+        delete event.tools.echo
+      }),
+    )
+    yield* s.admit("Use the renamed tool")
+    yield* s.llm.push(TestLLM.tool("call-renamed", "renamed_echo", { text: "renamed" }), [])
+
+    yield* s.resume
+
+    expect(s.requests[0]?.tools.map((tool) => tool.name)).toContain("renamed_echo")
+    expect(s.requests[0]?.tools.map((tool) => tool.name)).not.toContain("echo")
+    expect(s.executions).toEqual(["renamed"])
+  })
+
   scenario("executes the tool advertised before a registry reload", function* (s) {
     const registry = yield* Tool.Service
     const scope = yield* Scope.make()
@@ -1478,7 +1492,7 @@ describe("SessionRunnerLLM", () => {
       expect(continued.system.map((part) => part.text)).toContain("Checkpoint instructions")
       expect(systemTexts(continued)).toEqual(["Newest instructions"])
 
-      const forked = yield* s.session.fork({ sessionID, boundary: { type: "before", messageID: after.id } })
+      const forked = yield* s.session.fork({ sessionID, before: after.id })
       yield* s.session.prompt({ sessionID: forked.id, text: "Fork prompt", resume: false })
       yield* s.session.resume(forked.id)
       expect(s.requests.at(-1)?.messages[0]).toEqual(replacement[0])
@@ -1533,7 +1547,7 @@ describe("SessionRunnerLLM", () => {
     s.systemBaseline = "Latest context"
     yield* s.runPrompt("Third")
 
-    const forked = yield* s.session.fork({ sessionID, boundary: { type: "before", messageID: second.id } })
+    const forked = yield* s.session.fork({ sessionID, before: second.id })
     expect(
       yield* s.db.select().from(InstructionStateTable).where(eq(InstructionStateTable.session_id, forked.id)).get(),
     ).toMatchObject({
@@ -1543,7 +1557,7 @@ describe("SessionRunnerLLM", () => {
     yield* s.session.prompt({ sessionID: forked.id, text: "Forked", resume: false })
     yield* s.session.resume(forked.id)
 
-    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([defaultSystem, "Latest context"])
+    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([defaultSystem, fakeIdentity, "Latest context"])
     // Copied history keeps the frozen chronological update; no new update is emitted.
     expect(systemTexts(s.requests.at(-1)!)).toContain("Changed context")
     expect(systemTexts(s.requests.at(-1)!)).not.toContain("Latest context")
@@ -1578,14 +1592,14 @@ describe("SessionRunnerLLM", () => {
     s.systemBaseline = "Changed context"
     const second = yield* s.runPrompt("Second")
 
-    const child = yield* s.session.fork({ sessionID, boundary: { type: "before", messageID: second.id } })
+    const child = yield* s.session.fork({ sessionID, before: second.id })
     const inheritedFirst = (yield* s.session.messages({ sessionID: child.id })).find(
       (message) => message.type === "user" && message.text === "First",
     )
     if (!inheritedFirst) return yield* Effect.die(new Error("Nested fork boundary message not found"))
     const grandchild = yield* s.session.fork({
       sessionID: child.id,
-      boundary: { type: "before", messageID: inheritedFirst.id },
+      before: inheritedFirst.id,
     })
 
     expect(
@@ -1606,7 +1620,7 @@ describe("SessionRunnerLLM", () => {
     yield* s.resume
 
     expect(s.requests).toHaveLength(1)
-    expect(s.requests[0]?.system.map((part) => part.text)).toEqual([defaultSystem, "Initial context"])
+    expect(s.requests[0]?.system.map((part) => part.text)).toEqual([defaultSystem, fakeIdentity, "Initial context"])
     expect(messageRoles(s.requests[0])).toEqual(["user", "user"])
     // The projected row is authoritative: a missing row admits a fresh baseline
     // instead of rebuilding from durable events.
@@ -1642,8 +1656,8 @@ describe("SessionRunnerLLM", () => {
     expect(s.requests[0].messages).toHaveLength(1)
     expect(s.requests[1].messages.slice(0, 1)).toEqual([...s.requests[0].messages])
     expect(s.requests.map((request) => request.system.map((part) => part.text))).toEqual([
-      [defaultSystem, "Initial context"],
-      [defaultSystem, "Initial context"],
+      [defaultSystem, fakeIdentity, "Initial context"],
+      [defaultSystem, fakeIdentity, "Initial context"],
     ])
     expect(messageRoles(s.requests[1])).toEqual(["user", "system", "user"])
     expect(s.requests[1]?.messages.at(1)?.content).toEqual([Expected.text("Changed context")])
@@ -1682,6 +1696,7 @@ describe("SessionRunnerLLM", () => {
 
     expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([
       expect.stringContaining("# Delegation"),
+      gptIdentity,
       "Initial context",
     ])
   })
@@ -1702,6 +1717,7 @@ describe("SessionRunnerLLM", () => {
 
     expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([
       expect.stringContaining("# Delegation"),
+      gptIdentity,
       "Initial context",
     ])
   })
@@ -1719,7 +1735,11 @@ describe("SessionRunnerLLM", () => {
     yield* s.llm.push(TestLLM.text("Done", "text-build"))
     yield* s.resume
 
-    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual(["Build agent instructions", "Initial context"])
+    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([
+      "Build agent instructions",
+      fakeIdentity,
+      "Initial context",
+    ])
   })
 
   scenario("uses the configured default agent system for omitted-agent sessions", function* (s) {
@@ -1740,7 +1760,11 @@ describe("SessionRunnerLLM", () => {
     yield* s.llm.push(TestLLM.text("Done", "text-reviewer"))
     yield* s.resume
 
-    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual(["Reviewer instructions", "Initial context"])
+    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([
+      "Reviewer instructions",
+      fakeIdentity,
+      "Initial context",
+    ])
     expect((yield* s.messages)[0]).toMatchObject({ type: "assistant", agent: "reviewer" })
   })
 
@@ -1763,7 +1787,11 @@ describe("SessionRunnerLLM", () => {
     yield* s.llm.push(TestLLM.text("Done", "text-selected"))
     yield* s.resume
 
-    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual(["Reviewer instructions", "Initial context"])
+    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([
+      "Reviewer instructions",
+      fakeIdentity,
+      "Initial context",
+    ])
     expect((yield* s.messages)[0]).toMatchObject({ type: "assistant", agent: "reviewer" })
   })
 
@@ -1805,8 +1833,8 @@ describe("SessionRunnerLLM", () => {
     yield* s.runPrompt("Second")
 
     expect(s.requests.map((request) => request.system.map((part) => part.text))).toEqual([
-      [defaultSystem, "Initial context\n\nBuild skills"],
-      [defaultSystem, "Initial context\n\nBuild skills"],
+      [defaultSystem, fakeIdentity, "Initial context\n\nBuild skills"],
+      [defaultSystem, fakeIdentity, "Initial context\n\nBuild skills"],
     ])
     expect(systemTexts(s.requests[1])).toContainEqual(expect.stringContaining("Reviewer skills"))
   })
@@ -1828,7 +1856,7 @@ describe("SessionRunnerLLM", () => {
     yield* s.runPrompt("First")
 
     expect(s.requests.map((request) => request.system.map((part) => part.text))).toEqual([
-      [defaultSystem, "Initial context\n\nBuild skills"],
+      [defaultSystem, fakeIdentity, "Initial context\n\nBuild skills"],
     ])
   })
 
@@ -1847,7 +1875,7 @@ describe("SessionRunnerLLM", () => {
     yield* s.runPrompt("First")
     expect(s.requests.map((request) => request.model)).toEqual([model])
     expect(s.requests.map((request) => request.system.map((part) => part.text))).toEqual([
-      [defaultSystem, "Initial context"],
+      [defaultSystem, fakeIdentity, "Initial context"],
     ])
   })
 
@@ -1871,6 +1899,7 @@ describe("SessionRunnerLLM", () => {
     // String values render verbatim inside the initial tagged block.
     expect(s.requests[0]?.system.map((part) => part.text)).toEqual([
       defaultSystem,
+      fakeIdentity,
       ["Initial context", "", '<context key="deploy-target">', "production", "</context>"].join("\n"),
     ])
 
@@ -1925,7 +1954,16 @@ describe("SessionRunnerLLM", () => {
     expect(yield* entries.list(sessionID)).toEqual([{ key: "nullable", value: null }])
   })
 
-  scenario("rejects API instruction entries larger than 8KB", function* () {
+  scenario("accepts API instruction entries up to 256 KiB", function* () {
+    const entries = yield* InstructionEntry.Service
+    const value = "x".repeat(InstructionEntry.MaxValueBytes - 2)
+
+    yield* entries.put({ sessionID, key: "large", value })
+
+    expect(yield* entries.list(sessionID)).toEqual([{ key: "large", value }])
+  })
+
+  scenario("rejects API instruction entries larger than 256 KiB", function* () {
     const entries = yield* InstructionEntry.Service
 
     const exit = yield* entries
@@ -1949,9 +1987,9 @@ describe("SessionRunnerLLM", () => {
     yield* s.runPrompt("Third")
 
     expect(s.requests.map((request) => request.system.map((part) => part.text))).toEqual([
-      [defaultSystem, "Initial context"],
-      [defaultSystem, "Initial context"],
-      [defaultSystem, "Initial context"],
+      [defaultSystem, fakeIdentity, "Initial context"],
+      [defaultSystem, fakeIdentity, "Initial context"],
+      [defaultSystem, replacementIdentity, "Initial context"],
     ])
     expect(messageRoles(s.requests[1])).toEqual(["user", "system", "user"])
     expect(s.requests[2]?.messages.filter((message) => message.role === "system")).toHaveLength(2)
@@ -1968,6 +2006,38 @@ describe("SessionRunnerLLM", () => {
     yield* s.runPrompt("Fourth")
   })
 
+  scenario("records a same-model effort switch as a cache-preserving effort update", function* (s) {
+    s.currentModel = LanguageModel.make({ id: "claude-opus-5", provider: "anthropic", route: AnthropicMessages.route })
+    const model = { id: ID.make("claude-opus-5"), providerID: Provider.ID.make("anthropic") }
+    yield* s.bus.publish(SessionEvent.ModelSelected, {
+      sessionID,
+      model: { ...model, variant: Model.VariantID.make("high") },
+    })
+    yield* s.llm.push(TestLLM.text("Earlier answer", "text-effort-high"))
+    yield* s.runPrompt("First")
+    yield* s.bus.publish(SessionEvent.ModelSelected, {
+      sessionID,
+      model: { ...model, variant: Model.VariantID.make("low") },
+    })
+    s.currentModel = LanguageModel.update(s.currentModel, { defaults: { providerOptions: { effort: "low" } } })
+    yield* s.llm.push(TestLLM.text("Later answer", "text-effort-low"))
+    yield* s.runPrompt("Second")
+
+    expect(messageRoles(s.requests[1])).toEqual(["user", "assistant", "system", "user"])
+    expect(s.requests[1]?.messages[2]).toEqual(Message.effort({ effort: "low", previous: "high" }))
+
+    const compiled = yield* compileRequest(s.requests[1]!)
+    expect(compiled.body).toMatchObject({
+      output_config: { effort: "high" },
+      messages: [
+        { role: "user" },
+        { role: "assistant" },
+        { role: "system", content: [], output_config: { effort: "low" } },
+        { role: "user" },
+      ],
+    })
+  })
+
   scenario("preserves instruction values while a source is temporarily unavailable", function* (s) {
     yield* s.runPrompt("First")
     yield* s.bus.publish(SessionEvent.ModelSelected, {
@@ -1981,9 +2051,9 @@ describe("SessionRunnerLLM", () => {
     yield* s.runPrompt("Third")
 
     expect(s.requests.map((request) => request.system.map((part) => part.text))).toEqual([
-      [defaultSystem, "Initial context"],
-      [defaultSystem, "Initial context"],
-      [defaultSystem, "Initial context"],
+      [defaultSystem, fakeIdentity, "Initial context"],
+      [defaultSystem, replacementIdentity, "Initial context"],
+      [defaultSystem, replacementIdentity, "Initial context"],
     ])
   })
 
@@ -1999,16 +2069,16 @@ describe("SessionRunnerLLM", () => {
     yield* s.runPrompt("Second")
 
     expect(s.requests.map((request) => request.system.map((part) => part.text))).toEqual([
-      [defaultSystem, "Initial context"],
-      [defaultSystem, "Initial context"],
-      [defaultSystem, "Initial context"],
+      [defaultSystem, fakeIdentity, "Initial context"],
+      [defaultSystem, fakeIdentity, "Initial context"],
+      [defaultSystem, fakeIdentity, "Initial context"],
     ])
     expect(messageRoles(s.requests[2])).toEqual(["user", "system", "user"])
     expect(s.requests[2]?.messages.at(1)?.content).toEqual([Expected.text("Replacement context")])
     yield* replaySessionProjection(sessionID)
     const latest = yield* s.runPrompt("Third")
     expect(systemTexts(s.requests[3])).toEqual(["Replacement context"])
-    const fork = yield* s.session.fork({ sessionID, boundary: { type: "before", messageID: latest.id } })
+    const fork = yield* s.session.fork({ sessionID, before: latest.id })
     expect(
       (yield* s.session.context(fork.id)).flatMap((message) => (message.type === "system" ? [message.text] : [])),
     ).toEqual(["Replacement context"])
@@ -2393,15 +2463,16 @@ describe("SessionRunnerLLM", () => {
           model: { id: ID.make(s.currentModel.id), providerID: Provider.ID.make(s.currentModel.provider), variant },
         })
         const requestAgents: Agent.ID[] = []
-        yield* hooks.register("session", "context", (event) =>
+        const hook = (event: SessionHooks["context"]) =>
           Effect.sync(() => {
             expect(event.agent).toBe(agentID)
             expect(event.model.variant).toBe(variant)
             event.system.push(SystemPart.make("Hook-provided instructions"))
             event.tools.echo.description = "Hook-provided tool description"
-            event.generation.maxTokens = 4_000
-          }),
-        )
+            event.options.maxTokens = 4_000
+          })
+        yield* hooks.register("session", "context", hook)
+        yield* hooks.register("session", "compaction", hook)
         yield* hooks.register("session", "model.request", (event) =>
           Effect.sync(() => {
             requestAgents.push(event.agent)
@@ -2450,7 +2521,7 @@ describe("SessionRunnerLLM", () => {
           expect(compact[field]).toEqual(normal[field])
         expect(compact.toolChoice).toBeUndefined()
         expect(compact.system.map((part) => part.text)).toContain("Review the project carefully.")
-        expect(requestAgents[2]).toBe(Agent.ID.make("compaction"))
+        expect(requestAgents[2]).toBe(agentID)
         expect(s.executions).toEqual(["x".repeat(4_000)])
         expect((yield* s.messages).find((message) => message.type === "compaction")).toMatchObject({
           model: { id: s.currentModel.id, providerID: s.currentModel.provider, variant },
@@ -2565,7 +2636,7 @@ describe("SessionRunnerLLM", () => {
     expect(s.requests).toHaveLength(5)
     for (const request of s.requests) expect(request).toEqual(s.requests[0])
     expect(retries.map((event) => event.attempt)).toEqual([2, 3, 4, 5])
-    expect(retries.every((event) => event.sessionID === sessionID && event.agent === "compaction")).toBe(true)
+    expect(retries.every((event) => event.sessionID === sessionID && event.agent === "build")).toBe(true)
     expect(retries[3].decision).toEqual({ retry: true, delay: 60_000 })
     expect((yield* s.messages).find((message) => message.id === compaction.id)).toMatchObject({
       status: "completed",
@@ -2962,7 +3033,11 @@ describe("SessionRunnerLLM", () => {
     expect(resolutions).toBe(2)
     expect(s.requests).toHaveLength(3)
     expect(s.requests[2]?.model).toBe(replacementModel)
-    expect(s.requests[2]?.system.map((part) => part.text)).toEqual([defaultSystem, "Initial context"])
+    expect(s.requests[2]?.system.map((part) => part.text)).toEqual([
+      defaultSystem,
+      replacementIdentity,
+      "Initial context",
+    ])
     expect(systemTexts(s.requests[2])).toContain("Changed during compaction")
     expect(userTexts(s.requests[2])[0]).toContain("<summary>\n## Objective\n- Overflow summary\n</summary>")
     expect(userTexts(s.requests[2]).join("\n")).not.toContain("Queued during compaction")
@@ -3153,7 +3228,7 @@ describe("SessionRunnerLLM", () => {
     yield* s.runPrompt("Third")
 
     // Compaction already moved current values into the new epoch before the unavailable read.
-    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([defaultSystem, "Changed context"])
+    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([defaultSystem, fakeIdentity, "Changed context"])
     expect(systemTexts(s.requests.at(-1)!)).not.toContain("Changed context")
   })
 
@@ -3290,8 +3365,8 @@ describe("SessionRunnerLLM", () => {
 
     expect(s.requests.map((request) => request.model)).toEqual([model, replacementModel])
     expect(s.requests.map((request) => request.system.map((part) => part.text))).toEqual([
-      [defaultSystem, "Initial context"],
-      [defaultSystem, "Initial context"],
+      [defaultSystem, fakeIdentity, "Initial context"],
+      [defaultSystem, replacementIdentity, "Initial context"],
     ])
     expect(systemTexts(s.requests[1])).toContain("Replacement context")
   })
@@ -4372,7 +4447,13 @@ describe("SessionRunnerLLM", () => {
       Expected.assistant({}, [
         Expected.failedTool(
           { id: "call-missing" },
-          { error: { type: "tool.execution", message: "Unknown tool: missing" } },
+          {
+            error: {
+              type: "tool.execution",
+              message:
+                'No tool named "missing" is currently available. Please use a tool from the available tool list.',
+            },
+          },
         ),
       ]),
       Expected.assistant({ finish: "stop" }, [Expected.text("Recovered")]),
